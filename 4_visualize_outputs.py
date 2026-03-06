@@ -27,6 +27,7 @@ from egoallo.inference_utils import InferenceTrajectoryPaths
 from egoallo.network import EgoDenoiseTraj
 from egoallo.transforms import SE3, SO3
 from egoallo.vis_helpers import visualize_traj_and_hand_detections
+from src.egoallo.vis_helpers import visualize_traj_and_hand
 
 
 def main(
@@ -208,6 +209,22 @@ def load_and_visualize(
     )
     Ts_world_cpf = torch.from_numpy(outputs["Ts_world_cpf"]).to(device)
 
+    export_joint_traj(Ts_world_cpf,
+        traj,
+        body_model,)
+
+    visualize_traj_and_hand_detections(
+        server,
+        Ts_world_cpf,
+        traj,
+        body_model,
+        hamer_detections,
+        aria_detections,
+        points_data,
+        paths.splat_path,
+        floor_z=floor_z,
+    )
+
     def get_ego_video(
         start_index: int,
         end_index: int,
@@ -267,6 +284,56 @@ def load_and_visualize(
         get_ego_video=get_ego_video,
     )
 
+
+def export_joint_traj(Ts_world_cpf, traj, body_model):
+
+    if traj is not None:
+        betas = traj.betas
+        timesteps = betas.shape[1]
+        sample_count = betas.shape[0]
+        assert betas.shape == (sample_count, timesteps, 16)
+        body_quats = SO3.from_matrix(traj.body_rotmats).wxyz
+        assert body_quats.shape == (sample_count, timesteps, 21, 4)
+        device = body_quats.device
+
+        if traj.hand_rotmats is not None:
+            hand_quats = SO3.from_matrix(traj.hand_rotmats).wxyz
+            left_hand_quats = hand_quats[..., :15, :]
+            right_hand_quats = hand_quats[..., 15:30, :]
+        else:
+            left_hand_quats = None
+            right_hand_quats = None
+
+    shaped = body_model.with_shape(torch.mean(betas, dim=1, keepdim=True))
+    fk_outputs = shaped.with_pose_decomposed(
+        T_world_root=SE3.identity(
+            device=device, dtype=body_quats.dtype
+        ).parameters(),
+        body_quats=body_quats,
+        left_hand_quats=left_hand_quats,
+        right_hand_quats=right_hand_quats,
+    )
+
+
+    for t in range(Ts_world_cpf.shape[0]):
+        # Joints.
+        if fk_outputs is not None:
+            assert traj is not None
+            for j in range(sample_count):
+                joints_colors = np.zeros((21, 3))
+                joints_colors[:, 0] = traj.contacts[j, t, :].numpy(force=True)
+                joints_colors[:, 2] = 1.0 - traj.contacts[j, t, :].numpy(force=True)
+                joint_position_handles.append(
+                    server.scene.add_point_cloud(
+                        f"/timesteps/{t}/joints",
+                        points=fk_outputs.Ts_world_joint[j, t, :21, 4:7].numpy(
+                            force=True
+                        ),
+                        colors=joints_colors,
+                        point_shape="circle",
+                        point_size=0.02,
+                    )
+                )
 
 if __name__ == "__main__":
     tyro.cli(main)

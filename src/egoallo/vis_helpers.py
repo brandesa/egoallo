@@ -128,6 +128,10 @@ def add_splat_to_viser(
     )
 
 
+def visualize_traj_and_hand():
+    print(">>> Entered visualize_traj_and_hand")
+    
+
 def visualize_traj_and_hand_detections(
     server: viser.ViserServer,
     Ts_world_cpf: Float[Tensor, "timesteps 7"],
@@ -143,6 +147,7 @@ def visualize_traj_and_hand_detections(
 ) -> Callable[[], int]:
     """Chaotic mega-function for visualization. Returns a callback that should
     be called repeatedly in a loop."""
+    print(">>> Entered visualize_traj_and_hand_detections")
 
     timesteps = Ts_world_cpf.shape[0]
 

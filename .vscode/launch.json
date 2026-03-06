@@ -1,0 +1,18 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Visualize",
+            "type": "python",
+            "request": "launch",
+            "program": "${workspaceFolder}/4_visualize_outputs.py",
+            "python": "${workspaceFolder}/../venv/egoallo/bin/python",
+            "args": [
+                "--search-root-dir",
+                "./egoallo_example_trajectories",
+            ],
+            "console": "integratedTerminal",
+            "justMyCode": true
+        },
+    ]
+}
