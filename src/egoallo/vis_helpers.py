@@ -130,7 +130,7 @@ def add_splat_to_viser(
 
 def visualize_traj_and_hand():
     print(">>> Entered visualize_traj_and_hand")
-    
+
 
 def visualize_traj_and_hand_detections(
     server: viser.ViserServer,

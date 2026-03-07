@@ -9,7 +9,24 @@
             "python": "${workspaceFolder}/../venv/egoallo/bin/python",
             "args": [
                 "--search-root-dir",
-                "./egoallo_example_trajectories",
+                "./egoallo_eval",
+            ],
+            "console": "integratedTerminal",
+            "justMyCode": true
+        },
+        {
+            "name": "Inference",
+            "type": "python",
+            "request": "launch",
+            "program": "${workspaceFolder}/3_aria_inference.py",
+            "python": "${workspaceFolder}/../venv/egoallo/bin/python",
+            "args": [
+                "--traj-root",
+                "./egoallo_eval/walking",
+                "--traj-length",
+                "1000",
+                "--start-index",
+                "182"
             ],
             "console": "integratedTerminal",
             "justMyCode": true

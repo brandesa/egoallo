@@ -19,3 +19,4 @@ outputs/
 data/
 egoallo_checkpoint_*
 egoallo_example_*
+egoallo_eval/

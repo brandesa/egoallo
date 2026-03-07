@@ -14,6 +14,7 @@ from projectaria_tools.core.data_provider import (
     VrsDataProvider,
     create_vrs_data_provider,
 )
+from projectaria_tools.core import calibration
 from projectaria_tools.core.sensor_data import TimeDomain
 from tqdm import tqdm
 
@@ -29,6 +30,7 @@ from egoallo.transforms import SE3, SO3
 from egoallo.vis_helpers import visualize_traj_and_hand_detections
 from src.egoallo.vis_helpers import visualize_traj_and_hand
 
+from src.egoallo import fncsmpl_extensions
 
 def main(
     search_root_dir: Path,
@@ -67,6 +69,11 @@ def main(
 
     current_file = "None"
     loop_cb = lambda: None
+
+    #set such that it always takes the first file in the list if there is at least one file
+    if options != ["None"]:
+        file_dropdown.value = options[-1]
+
 
     while True:
         loop_cb()
@@ -147,6 +154,27 @@ def load_and_visualize(
             device_calib.get_transform_device_cpf().to_quat_and_translation()
         )
     )
+    
+    raw_calib = device_calib.get_camera_calib("camera-rgb") 
+    w, h = raw_calib.get_image_size()
+        
+    # Create the standard pinhole model (Rectified)
+    linear_calib = calibration.get_linear_camera_calibration(
+        int(w), int(h),
+        raw_calib.get_focal_lengths()[0],
+        "pinhole",
+        raw_calib.get_transform_device_camera(),
+    )
+    
+    # Standardize rotation for head-mounted portrait-to-landscape conversion
+    calib = calibration.rotate_camera_calib_cw90deg(linear_calib)
+    
+    
+    T_device_camera = SE3(
+        torch.from_numpy(
+            calib.get_transform_device_camera().to_quat_and_translation()
+        )
+    )
     assert T_device_cpf.wxyz_xyz.shape == (1, 7)
     pose_timestamps_sec = outputs["timestamps_ns"] / 1e9
 
@@ -209,21 +237,7 @@ def load_and_visualize(
     )
     Ts_world_cpf = torch.from_numpy(outputs["Ts_world_cpf"]).to(device)
 
-    export_joint_traj(Ts_world_cpf,
-        traj,
-        body_model,)
-
-    visualize_traj_and_hand_detections(
-        server,
-        Ts_world_cpf,
-        traj,
-        body_model,
-        hamer_detections,
-        aria_detections,
-        points_data,
-        paths.splat_path,
-        floor_z=floor_z,
-    )
+    export_joint_traj(Ts_world_cpf, traj, body_model, T_device_cpf, T_device_camera)
 
     def get_ego_video(
         start_index: int,
@@ -285,7 +299,7 @@ def load_and_visualize(
     )
 
 
-def export_joint_traj(Ts_world_cpf, traj, body_model):
+def export_joint_traj(Ts_world_cpf, traj, body_model, T_device_cpf, T_device_camera):
 
     if traj is not None:
         betas = traj.betas
@@ -295,6 +309,7 @@ def export_joint_traj(Ts_world_cpf, traj, body_model):
         body_quats = SO3.from_matrix(traj.body_rotmats).wxyz
         assert body_quats.shape == (sample_count, timesteps, 21, 4)
         device = body_quats.device
+        dtype = body_quats.dtype
 
         if traj.hand_rotmats is not None:
             hand_quats = SO3.from_matrix(traj.hand_rotmats).wxyz
@@ -304,36 +319,50 @@ def export_joint_traj(Ts_world_cpf, traj, body_model):
             left_hand_quats = None
             right_hand_quats = None
 
-    shaped = body_model.with_shape(torch.mean(betas, dim=1, keepdim=True))
-    fk_outputs = shaped.with_pose_decomposed(
-        T_world_root=SE3.identity(
-            device=device, dtype=body_quats.dtype
-        ).parameters(),
-        body_quats=body_quats,
-        left_hand_quats=left_hand_quats,
-        right_hand_quats=right_hand_quats,
-    )
+        shaped = body_model.with_shape(torch.mean(betas, dim=1, keepdim=True))
+        fk_outputs = shaped.with_pose_decomposed(
+            T_world_root=SE3.identity(
+                device=device, dtype=body_quats.dtype
+            ).parameters(),
+            body_quats=body_quats,
+            left_hand_quats=left_hand_quats,
+            right_hand_quats=right_hand_quats,
+        )
+        assert Ts_world_cpf.shape == (timesteps, 7)
+        T_world_root = fncsmpl_extensions.get_T_world_root_from_cpf_pose(
+            # Batch axes of fk_outputs are (num_samples, time).
+            # Batch axes of Ts_world_cpf are (time,).
+            fk_outputs,
+            Ts_world_cpf[None, ...],
+        )
+        fk_outputs = fk_outputs.with_new_T_world_root(T_world_root)
 
+        # Build SE3 transforms on the same device/dtype.
+        Ts_world_cpf_se3 = SE3(Ts_world_cpf.to(device=device, dtype=dtype))
+        T_device_cpf_se3 = SE3(T_device_cpf.wxyz_xyz.to(device=device, dtype=dtype))
+        T_device_camera_se3 = SE3(T_device_camera.wxyz_xyz.to(device=device, dtype=dtype))
 
-    for t in range(Ts_world_cpf.shape[0]):
-        # Joints.
-        if fk_outputs is not None:
-            assert traj is not None
-            for j in range(sample_count):
-                joints_colors = np.zeros((21, 3))
-                joints_colors[:, 0] = traj.contacts[j, t, :].numpy(force=True)
-                joints_colors[:, 2] = 1.0 - traj.contacts[j, t, :].numpy(force=True)
-                joint_position_handles.append(
-                    server.scene.add_point_cloud(
-                        f"/timesteps/{t}/joints",
-                        points=fk_outputs.Ts_world_joint[j, t, :21, 4:7].numpy(
-                            force=True
-                        ),
-                        colors=joints_colors,
-                        point_shape="circle",
-                        point_size=0.02,
-                    )
-                )
+        # World -> camera for each timestep, then camera -> world.
+        T_world_camera = Ts_world_cpf_se3 @ T_device_cpf_se3.inverse() @ T_device_camera_se3
+        T_camera_world = T_world_camera.inverse()
+
+        # Joint positions in world and camera frames.
+        joint_positions_world = fk_outputs.Ts_world_joint[..., 4:7]
+        joint_positions_cam = torch.empty_like(joint_positions_world[0])
+
+        # Iterate over time to apply the corresponding camera transform.
+        for t in range(timesteps):
+            # Slice underlying parameters to build a per-frame SE3, then apply.
+            T_camera_world_t = SE3(T_camera_world.wxyz_xyz[t])
+            joint_positions_cam[t] = T_camera_world_t @ joint_positions_world[:, t]
+
+        # Export to NPZ (move to CPU and NumPy).
+        payload = {
+            # "joint_positions_world": joint_positions_world.cpu().numpy(force=True),
+            "joint_positions": joint_positions_cam.cpu().numpy(force=True),
+            # "T_world_camera": T_world_camera.as_matrix().cpu().numpy(force=True),
+        }
+        np.savez("joint_positions.npz", **payload)
 
 if __name__ == "__main__":
     tyro.cli(main)
