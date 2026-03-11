@@ -111,6 +111,7 @@ class InferenceInputTransforms(TensorDataclass):
     Ts_world_cpf: Float[Tensor, "timesteps 7"]
     Ts_world_device: Float[Tensor, "timesteps 7"]
     pose_timesteps: tuple[float, ...]
+    aria_fps: float | None = None
 
     @staticmethod
     def load(
@@ -157,4 +158,5 @@ class InferenceInputTransforms(TensorDataclass):
             .parameters()
             .to(torch.float32),
             pose_timesteps=tuple(out_timestamps_secs),
+            aria_fps=aria_fps,
         )

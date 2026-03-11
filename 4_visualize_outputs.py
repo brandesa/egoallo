@@ -347,7 +347,12 @@ def export_joint_traj(Ts_world_cpf, traj, body_model, T_device_cpf, T_device_cam
         T_camera_world = T_world_camera.inverse()
 
         # Joint positions in world and camera frames.
-        joint_positions_world = fk_outputs.Ts_world_joint[..., 4:7]
+        #root 
+        root_position_world = fk_outputs.T_world_root[..., 4:7]
+        #smpl joints
+        joint_positions_no_root_world = fk_outputs.Ts_world_joint[..., 4:7]
+        joint_positions_world = torch.cat([root_position_world.unsqueeze(2), joint_positions_no_root_world], dim=2)
+        # joint_positions_world = fk_outputs.Ts_world_joint[..., 4:7]
         joint_positions_cam = torch.empty_like(joint_positions_world[0])
 
         # Iterate over time to apply the corresponding camera transform.

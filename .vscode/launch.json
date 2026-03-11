@@ -31,5 +31,16 @@
             "console": "integratedTerminal",
             "justMyCode": true
         },
+        {
+            "name": "Export",
+            "type": "python",
+            "request": "launch",
+            "program": "${workspaceFolder}/6_eval_egohtg.py",
+            "python": "${workspaceFolder}/../venv/egoallo/bin/python",
+            "args": [
+            ],
+            "console": "integratedTerminal",
+            "justMyCode": true
+        },
     ]
 }
