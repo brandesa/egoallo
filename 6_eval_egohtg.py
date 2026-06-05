@@ -25,7 +25,7 @@ from egoallo.sampling import run_sampling_with_stitching
 from egoallo.transforms import SE3, SO3
 from egoallo.vis_helpers import visualize_traj_and_hand_detections
 
-from egoallo_eval.configs import SequenceContext, EVAL_XHALL, EXOMC_XHALL
+from egoallo_eval.configs import SequenceContext, EVAL_XHALL, EXOMC_XHALL, ALL, ONE, CLEAN
 from projectaria_tools.core.data_provider import (
     VrsDataProvider,
     create_vrs_data_provider,
@@ -89,47 +89,91 @@ def main(args: Args, seq_ctx: SequenceContext) -> None:
     #Set traj start and length
     if cfg["traj_start_frame_idx"] is not None:
         args.start_index = int(cfg["traj_start_frame_idx"] * fps / transforms.aria_fps)
-        args.traj_length = transforms.Ts_world_cpf.shape[0] - args.start_index - 1
+        args.traj_length = transforms.Ts_world_cpf.shape[0] - args.start_index
     else:
         ValueError(f"[WARNING]: No traj_start_frame_idx specified in config")
 
-    # Note the off-by-one for Ts_world_cpf, which we need for relative transform computation.
-    Ts_world_cpf = (
-        SE3(
-            transforms.Ts_world_cpf[
-                args.start_index : args.start_index + args.traj_length + 1
-            ]
-        )
-        @ SE3.from_rotation(
-            SO3.from_x_radians(
-                transforms.Ts_world_cpf.new_tensor(args.glasses_x_angle_offset)
+    # INFO printing
+    print(f"[INFO]: Starting inference for sequence {args.seq}")
+    print(f"[INFO]: Trajectory start index: {args.start_index}")
+    print(f"[INFO]: Trajectory length: {args.traj_length}")
+
+    #run in chunks 
+    chunk_size = 6000
+    joint_positions_cam = torch.empty(
+        (args.traj_length-1, 52, 3), device=device
+    )  # (time, joints, xyz)
+    verts_cam = torch.empty(
+        (args.num_samples, args.traj_length-1, 6890, 3), device=device
+    )  # (samples, time, vertices, xyz)
+    for chunk_start in range(args.start_index, args.start_index + args.traj_length, chunk_size):
+        chunk_end = min(chunk_start + chunk_size, args.start_index + args.traj_length)
+        print(f"[INFO]: Running inference on frames {chunk_start} to {chunk_end}")
+
+        if chunk_start != args.start_index:
+            transforms = InferenceInputTransforms.load(
+                seq_ctx.aria_subject.aria_vrs, seq_ctx.aria_subject.aria_slam_dir, fps=fps
+            ).to(device=device)
+
+
+        # Note the off-by-one for Ts_world_cpf, which we need for relative transform computation.
+        Ts_world_cpf = (
+            SE3(
+                transforms.Ts_world_cpf[
+                    chunk_start : chunk_end + 1
+                ]
             )
+            @ SE3.from_rotation(
+                SO3.from_x_radians(
+                    transforms.Ts_world_cpf.new_tensor(args.glasses_x_angle_offset)
+                )
+            )
+        ).parameters()
+        del transforms
+
+        # server = None
+        # if args.visualize_traj:
+        #     server = viser.ViserServer()
+        #     server.gui.configure_theme(dark_mode=True)
+
+        denoiser_network = load_denoiser(args.checkpoint_dir).to(device)
+        body_model = fncsmpl.SmplhModel.load(args.smplh_npz_path).to(device)
+
+       
+
+        traj = run_sampling_with_stitching(
+            denoiser_network,
+            body_model=body_model,
+            guidance_mode=args.guidance_mode,
+            guidance_inner=args.guidance_inner,
+            guidance_post=args.guidance_post,
+            Ts_world_cpf=Ts_world_cpf,
+            hamer_detections=None,
+            aria_detections=None,
+            num_samples=args.num_samples,
+            device=device,
+            floor_z=floor_z,
+            guidance_verbose=False,
         )
-    ).parameters()
-    del transforms
 
-    server = None
-    if args.visualize_traj:
-        server = viser.ViserServer()
-        server.gui.configure_theme(dark_mode=True)
+        T_device_cpf, T_device_camera = get_device_and_camera_transforms(seq_ctx)
 
-    denoiser_network = load_denoiser(args.checkpoint_dir).to(device)
-    body_model = fncsmpl.SmplhModel.load(args.smplh_npz_path).to(device)
+        joint_positions_cam_chunk, verts_cam_chunk, faces_chunk = get_joint_traj(Ts_world_cpf[1:, :], traj, body_model, T_device_cpf, T_device_camera)
+        # verts_cam_chunk is (S, T, V, 3), assign to corresponding slice
+        verts_cam[:, chunk_start-args.start_index:chunk_end-args.start_index] = verts_cam_chunk
+        joint_positions_cam[chunk_start-args.start_index:chunk_end-args.start_index] = joint_positions_cam_chunk
 
-    traj = run_sampling_with_stitching(
-        denoiser_network,
-        body_model=body_model,
-        guidance_mode=args.guidance_mode,
-        guidance_inner=args.guidance_inner,
-        guidance_post=args.guidance_post,
-        Ts_world_cpf=Ts_world_cpf,
-        hamer_detections=None,
-        aria_detections=None,
-        num_samples=args.num_samples,
-        device=device,
-        floor_z=floor_z,
+    export_joint_traj(seq_ctx.egoallo_data, joint_positions_cam, verts_cam, faces_chunk)
+    save_name = (
+        time.strftime("%Y%m%d-%H%M%S")
+        + f"_{args.start_index}-{args.start_index + args.traj_length}"
+    )
+    (seq_ctx.egoallo_data.parent / (save_name + "_args.yaml")).write_text(
+        yaml.dump(dataclasses.asdict(args))
     )
 
+
+def get_device_and_camera_transforms(seq_ctx: SequenceContext):
     provider = create_vrs_data_provider(str(seq_ctx.aria_subject.aria_vrs))
     device_calib = provider.get_device_calibration()
     T_device_cpf = SE3(
@@ -158,91 +202,125 @@ def main(args: Args, seq_ctx: SequenceContext) -> None:
             calib.get_transform_device_camera().to_quat_and_translation()
         )
     )
-
-    export_joint_traj(seq_ctx.egoallo_data, Ts_world_cpf[1:, :], traj, body_model, T_device_cpf, T_device_camera)
-
-    save_name = (
-        time.strftime("%Y%m%d-%H%M%S")
-        + f"_{args.start_index}-{args.start_index + args.traj_length}"
-    )
-    (seq_ctx.egoallo_data.parent / (save_name + "_args.yaml")).write_text(
-        yaml.dump(dataclasses.asdict(args))
-    )
-
+    return T_device_cpf, T_device_camera
 
 def load_config(path: Path):
     with open(str(path), "r") as f:
         return yaml.safe_load(f)["generator_config"]["aria_time_sync"]
 
-def export_joint_traj(out_path, Ts_world_cpf, traj, body_model, T_device_cpf, T_device_camera):
+def get_joint_traj(Ts_world_cpf, traj, body_model, T_device_cpf, T_device_camera):
 
-    if traj is not None:
-        betas = traj.betas
-        timesteps = betas.shape[1]
-        sample_count = betas.shape[0]
-        assert betas.shape == (sample_count, timesteps, 16)
-        body_quats = SO3.from_matrix(traj.body_rotmats).wxyz
-        assert body_quats.shape == (sample_count, timesteps, 21, 4)
-        device = body_quats.device
-        dtype = body_quats.dtype
+    betas = traj.betas
+    timesteps = betas.shape[1]
+    sample_count = betas.shape[0]
+    assert betas.shape == (sample_count, timesteps, 16)
+    body_quats = SO3.from_matrix(traj.body_rotmats).wxyz
+    assert body_quats.shape == (sample_count, timesteps, 21, 4)
+    device = body_quats.device
+    dtype = body_quats.dtype
 
-        if traj.hand_rotmats is not None:
-            hand_quats = SO3.from_matrix(traj.hand_rotmats).wxyz
-            left_hand_quats = hand_quats[..., :15, :]
-            right_hand_quats = hand_quats[..., 15:30, :]
-        else:
-            left_hand_quats = None
-            right_hand_quats = None
+    if traj.hand_rotmats is not None:
+        hand_quats = SO3.from_matrix(traj.hand_rotmats).wxyz
+        left_hand_quats = hand_quats[..., :15, :]
+        right_hand_quats = hand_quats[..., 15:30, :]
+    else:
+        left_hand_quats = None
+        right_hand_quats = None
 
-        shaped = body_model.with_shape(torch.mean(betas, dim=1, keepdim=True))
-        fk_outputs = shaped.with_pose_decomposed(
-            T_world_root=SE3.identity(
-                device=device, dtype=body_quats.dtype
-            ).parameters(),
-            body_quats=body_quats,
-            left_hand_quats=left_hand_quats,
-            right_hand_quats=right_hand_quats,
+    shaped = body_model.with_shape(torch.mean(betas, dim=1, keepdim=True))
+    fk_outputs = shaped.with_pose_decomposed(
+        T_world_root=SE3.identity(
+            device=device, dtype=body_quats.dtype
+        ).parameters(),
+        body_quats=body_quats,
+        left_hand_quats=left_hand_quats,
+        right_hand_quats=right_hand_quats,
+    )
+    assert Ts_world_cpf.shape == (timesteps, 7)
+    T_world_root = fncsmpl_extensions.get_T_world_root_from_cpf_pose(
+        # Batch axes of fk_outputs are (num_samples, time).
+        # Batch axes of Ts_world_cpf are (time,).
+        fk_outputs,
+        Ts_world_cpf[None, ...],
+    )
+    fk_outputs = fk_outputs.with_new_T_world_root(T_world_root)
+
+    # Build SE3 transforms on the same device/dtype.
+    Ts_world_cpf_se3 = SE3(Ts_world_cpf.to(device=device, dtype=dtype))
+    T_device_cpf_se3 = SE3(T_device_cpf.wxyz_xyz.to(device=device, dtype=dtype))
+    T_device_camera_se3 = SE3(T_device_camera.wxyz_xyz.to(device=device, dtype=dtype))
+
+    # World -> camera for each timestep, then camera -> world.
+    T_world_camera = Ts_world_cpf_se3 @ T_device_cpf_se3.inverse() @ T_device_camera_se3
+    T_camera_world = T_world_camera.inverse()
+
+    # Joint positions in world and camera frames.
+    #root 
+    root_position_world = fk_outputs.T_world_root[..., 4:7]
+    #smpl joints
+    joint_positions_no_root_world = fk_outputs.Ts_world_joint[..., 4:7]
+    joint_positions_world = torch.cat([root_position_world.unsqueeze(2), joint_positions_no_root_world], dim=2)
+    # joint_positions_world = fk_outputs.Ts_world_joint[..., 4:7]
+    joint_positions_cam = torch.empty_like(joint_positions_world[0])
+
+    # Iterate over time to apply the corresponding camera transform.
+    for t in range(timesteps):
+        # Slice underlying parameters to build a per-frame SE3, then apply.
+        T_camera_world_t = SE3(T_camera_world.wxyz_xyz[t])
+        joint_positions_cam[t] = T_camera_world_t @ joint_positions_world[:, t]
+
+    # Extract per-frame vertices by re-posing the body model.
+    # For each timestep, we call with_pose_decomposed() to get the posed vertices.
+    verts_list = []
+    for t in range(timesteps):
+        # Get the pose for all samples at timestep t
+        body_quats_t = body_quats[:, t:t+1, :, :]  # (S, 1, 21, 4)
+        left_hand_quats_t = left_hand_quats[:, t:t+1, :, :] if left_hand_quats is not None else None
+        right_hand_quats_t = right_hand_quats[:, t:t+1, :, :] if right_hand_quats is not None else None
+        
+        # Get the actual root transform for this timestep (must match joint positions)
+        T_world_root_t = fk_outputs.T_world_root[:, t]  # (S, 7)
+        
+        # Re-pose to get vertices at this frame with the correct root transform
+        posed_t = shaped.with_pose_decomposed(
+            T_world_root=T_world_root_t,
+            body_quats=body_quats_t,
+            left_hand_quats=left_hand_quats_t,
+            right_hand_quats=right_hand_quats_t,
         )
-        assert Ts_world_cpf.shape == (timesteps, 7)
-        T_world_root = fncsmpl_extensions.get_T_world_root_from_cpf_pose(
-            # Batch axes of fk_outputs are (num_samples, time).
-            # Batch axes of Ts_world_cpf are (time,).
-            fk_outputs,
-            Ts_world_cpf[None, ...],
-        )
-        fk_outputs = fk_outputs.with_new_T_world_root(T_world_root)
+        # posed_t.lbs() applies linear blend skinning to get deformed vertices in world frame
+        mesh_t = posed_t.lbs()
+        # mesh_t.verts is (S, V, 3) - deformed vertices at this pose in world frame
+        verts_list.append(mesh_t.verts[:,0])
 
-        # Build SE3 transforms on the same device/dtype.
-        Ts_world_cpf_se3 = SE3(Ts_world_cpf.to(device=device, dtype=dtype))
-        T_device_cpf_se3 = SE3(T_device_cpf.wxyz_xyz.to(device=device, dtype=dtype))
-        T_device_camera_se3 = SE3(T_device_camera.wxyz_xyz.to(device=device, dtype=dtype))
+    # Stack across time: (S, T, V, 3)
+    # verts_list contains T tensors of shape (S, V, 3), stack on dim=1 for time
+    verts_STV = torch.stack(verts_list, dim=1)
 
-        # World -> camera for each timestep, then camera -> world.
-        T_world_camera = Ts_world_cpf_se3 @ T_device_cpf_se3.inverse() @ T_device_camera_se3
-        T_camera_world = T_world_camera.inverse()
+    # Now transform to camera frame per-frame
+    verts_cam_STV = torch.empty_like(verts_STV, device=device, dtype=dtype)
+    for t in range(timesteps):
+        T_camera_world_t = SE3(T_camera_world.wxyz_xyz[t])
+        # verts_STV[:, t] is (S, V, 3), transform each sample's vertices
+        verts_cam_STV[:, t] = T_camera_world_t @ verts_STV[:, t]
 
-        # Joint positions in world and camera frames.
-        #root 
-        root_position_world = fk_outputs.T_world_root[..., 4:7]
-        #smpl joints
-        joint_positions_no_root_world = fk_outputs.Ts_world_joint[..., 4:7]
-        joint_positions_world = torch.cat([root_position_world.unsqueeze(2), joint_positions_no_root_world], dim=2)
-        # joint_positions_world = fk_outputs.Ts_world_joint[..., 4:7]
-        joint_positions_cam = torch.empty_like(joint_positions_world[0])
+    # Get faces from body model (constant across time)
+    faces = body_model.faces
 
-        # Iterate over time to apply the corresponding camera transform.
-        for t in range(timesteps):
-            # Slice underlying parameters to build a per-frame SE3, then apply.
-            T_camera_world_t = SE3(T_camera_world.wxyz_xyz[t])
-            joint_positions_cam[t] = T_camera_world_t @ joint_positions_world[:, t]
+    return joint_positions_cam, verts_cam_STV, faces
 
-        # Export to NPZ (move to CPU and NumPy).
-        payload = {
-            # "joint_positions_world": joint_positions_world.cpu().numpy(force=True),
-            "joint_positions": joint_positions_cam.cpu().numpy(force=True),
-            # "T_world_camera": T_world_camera.as_matrix().cpu().numpy(force=True),
-        }
-        np.savez(out_path, **payload)
+def export_joint_traj(out_path, joint_positions_cam, verts_cam=None, faces=None):
+    # Export to NPZ (move to CPU and NumPy).
+    payload = {
+        # "joint_positions_world": joint_positions_world.cpu().numpy(force=True),
+        "joint_positions": joint_positions_cam.cpu().numpy(force=True),
+        "verts": verts_cam.cpu().numpy(force=True) if verts_cam is not None else None,
+        "faces": faces.cpu().numpy(force=True) if faces is not None else None,
+        # "T_world_camera": T_world_camera.as_matrix().cpu().numpy(force=True),
+    }
+    
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez(out_path, **payload)
 
 
 
@@ -257,12 +335,12 @@ if __name__ == "__main__":
         main(tyro.cli(Args), seq_ctx=seq_ctx)
 
     else:
-        sequences = EVAL_XHALL
+        sequences = ONE
         for seq in sequences:
             # Create SequenceContext
             seq_ctx = SequenceContext(name=seq, root=seq_root)
 
-            try:
-                main(tyro.cli(Args), seq_ctx=seq_ctx)
-            except Exception as e:
-                print(f"Error occurred while processing sequence {seq}: {e}")
+            # try:
+            main(tyro.cli(Args), seq_ctx=seq_ctx)
+            # except Exception as e:
+                # print(f"Error occurred while processing sequence {seq}: {e}")
